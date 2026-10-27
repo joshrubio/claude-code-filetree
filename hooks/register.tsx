@@ -1571,6 +1571,9 @@ let readingPath = ''
 let readPoll: Timer | null = null
 // How far each file was read, in percent; 0 means nothing to resume.
 const readMarks = new Map<string, number>()
+// Which start spot each file has chosen, and a fingerprint of the text it was chosen from.
+const readPicks = new Map<string, number>()
+const readSigs = new Map<string, string>()
 
 async function speak($: EngineInterface, args: string[]): Promise<string | null> {
   const script = `${$.plugin.root}/scripts/read-aloud/speak.py`
@@ -1601,17 +1604,44 @@ function stopPolling(): void {
   readPoll = null
 }
 
-async function toggleReading($: EngineInterface, path: string, how: 'resume' | 'start'): Promise<void> {
-  if (readingPath === path) {
-    stopPolling()
-    readingPath = ''
-    await speak($, ['--stop'])
-    await refreshReadMark($, path)
-    $.ui.invalidate('ui.render')
-    return
+type ReadFrom = { kind: 'resume' } | { kind: 'start' } | { kind: 'text'; text: string } | { kind: 'percent'; n: number }
+type ReadSpot = { label: string; from: ReadFrom }
+
+// Where the person can start reading: the headings of a document, else tenths of it.
+function readSpots(text: string, markdown: boolean): ReadSpot[] {
+  const spots: ReadSpot[] = [{ label: 'the beginning', from: { kind: 'start' } }]
+  const heads: ReadSpot[] = []
+  if (markdown) {
+    let fenced = false
+    for (const line of text.split('\n')) {
+      if (/^\s*(```|~~~)/.test(line)) fenced = !fenced
+      const m = fenced ? null : /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line)
+      if (!m) continue
+      // The script reads the document the way it speaks it: no markup, link text only.
+      const plain = (m[2] ?? '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[*_`>#]+/g, '').replace(/\s+/g, ' ').trim()
+      if (plain) heads.push({ label: plain, from: { kind: 'text', text: plain } })
+    }
   }
+  if (heads.length) return [...spots, ...heads.slice(0, 80)]
+  for (let n = 10; n < 100; n += 10) spots.push({ label: `${n}%`, from: { kind: 'percent', n } })
+  return spots
+}
+
+async function stopReading($: EngineInterface, path: string): Promise<void> {
+  stopPolling()
+  readingPath = ''
+  await speak($, ['--stop'])
+  await refreshReadMark($, path)
+  $.ui.invalidate('ui.render')
+}
+
+// Starting while another reading plays is fine: the script stops the old one first.
+async function startReading($: EngineInterface, path: string, from: ReadFrom): Promise<void> {
   const args = ['--detach', '--file', path, '--max-chars', String(READ_MAX_CHARS), '--chunk-chars', String(READ_CHUNK_CHARS)]
-  const started = await speak($, how === 'resume' ? [...args, '--resume'] : args)
+  if (from.kind === 'resume') args.push('--resume')
+  else if (from.kind === 'text') args.push('--from-text', from.text)
+  else if (from.kind === 'percent') args.push('--from-percent', String(from.n))
+  const started = await speak($, args)
   if (started === null) {
     $.ui.toast('could not read aloud: python or the speech script is missing')
     return
@@ -2233,17 +2263,47 @@ export const register: Register = (on, options) => {
               return <Button key={`pv-${k}`} plain dimColor hotkey={k} label={label} onPress={() => void (step ? jumpDiff($, by > 0 ? 1 : -1) : scrollPreview($, by)).then(() => parkPreview($))} />
             })}
             <Button key="pv-d" plain dimColor hotkey="d" label={p?.diff ? (t.nodes.find(n => n.id === t.preview)?.kind === 'dir' ? 'tree' : 'file') : 'diff'} onPress={() => void diffFile($, t.preview)} />
-            {READABLE.test(t.preview) ? (() => {
-              const mark = readingPath === t.preview ? 0 : knowReadMark($, t.preview)
-              const isReading = readingPath === t.preview
-              const label = isReading ? (unicode ? '■ stop' : '\u{f04d} stop') : mark ? `${unicode ? '▶' : '\u{f028}'} resume ${mark}%` : unicode ? '▶ read' : '\u{f028} read'
-              return [
-                <Button key="pv-read" plain dimColor hotkey="r" label={label} onPress={() => void toggleReading($, t.preview, mark ? 'resume' : 'start')} />,
-                mark ? <Button key="pv-restart" plain dimColor hotkey="s" label={unicode ? '⟲ start over' : '\u{f021} start over'} onPress={() => void toggleReading($, t.preview, 'start')} /> : null,
-              ]
-            })() : null}
             {editWithSetting || inTmux || inHerdr ? <Button key="edit" plain dimColor autoFocus hotkey="e" label={`${unicode ? 'edit' : '\u{ea73} edit'} :${previewLine}`} onPress={() => void editPreview($, t.preview)} /> : null}
           </Box>
+          {READABLE.test(t.preview) ? (() => {
+            const path = t.preview
+            const text = p?.text ?? ''
+            // A rewritten file is a different text: forget the place and the spot chosen in the old one.
+            const sig = `${text.length}:${text.slice(0, 200)}:${text.slice(-200)}`
+            if (readSigs.get(path) !== sig) {
+              if (readSigs.has(path)) {
+                readMarks.delete(path)
+                readPicks.delete(path)
+              }
+              readSigs.set(path, sig)
+            }
+            const isReading = readingPath === path
+            const mark = isReading ? 0 : knowReadMark($, path)
+            const spots = readSpots(text, markdown)
+            const pick = Math.min(readPicks.get(path) ?? 0, spots.length - 1)
+            const spot = spots[pick] ?? spots[0]
+            const shortLabel = (spot?.label ?? '').length > 34 ? `${(spot?.label ?? '').slice(0, 33)}…` : spot?.label ?? ''
+            const move = (by: number) => {
+              readPicks.set(path, (pick + by + spots.length) % spots.length)
+              $.ui.invalidate('ui.render')
+            }
+            const label = isReading ? (unicode ? '■ stop' : '\u{f04d} stop') : mark ? `${unicode ? '▶' : '\u{f028}'} resume ${mark}%` : unicode ? '▶ read' : '\u{f028} read'
+            return (
+              <Box flexDirection="column">
+                <Box flexDirection="row" gap={2}>
+                  <Button key="pv-read" plain dimColor hotkey="r" label={label} onPress={() => void (isReading ? stopReading($, path) : startReading($, path, mark ? { kind: 'resume' } : { kind: 'start' }))} />
+                  <Button key="pv-restart" plain dimColor hotkey="s" label={unicode ? '⟲ restart' : '\u{f021} restart'} onPress={() => void startReading($, path, { kind: 'start' })} />
+                </Box>
+                <Box flexDirection="row" gap={2}>
+                  <Text {...mutedText}>start at</Text>
+                  <Button key="pv-spot-prev" plain dimColor label="◀" onPress={() => move(-1)} />
+                  <Text>{shortLabel}</Text>
+                  <Button key="pv-spot-next" plain dimColor label="▶" onPress={() => move(1)} />
+                  <Button key="pv-spot-go" plain dimColor hotkey="g" label={unicode ? '▶ from here' : '\u{f028} from here'} onPress={() => void startReading($, path, spot?.from ?? { kind: 'start' })} />
+                </Box>
+              </Box>
+            )
+          })() : null}
           {p?.note ? <Text {...mutedText}>{p.note}</Text> : null}
           {nativeScroll ? directPreview(elements, win, t.preview, markdown, theme.accent) : (
             <Client

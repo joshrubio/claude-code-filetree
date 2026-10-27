@@ -10,6 +10,7 @@
   speak.py --playing            print 1 while a reading is under way, else 0
   speak.py --file PATH --resume continue a file from where it stopped
   speak.py --bookmark PATH      print how far a file was read, as a percent
+  speak.py --file PATH --from-text T | --from-percent N   start part-way in
   speak.py --stop               stop playback
   speak.py --detach             re-launch detached, return immediately
   speak.py --hook               Stop-hook mode: exit fast unless auto_read is on
@@ -261,16 +262,26 @@ def bookmark_get(path: str, total: int | None = None) -> tuple[int, int]:
         key, size, mtime = _file_key(path)
     except OSError:
         return 0, 0
-    rec = _load_bookmarks().get(key)
-    if not rec or rec.get("size") != size or rec.get("mtime") != mtime:
+    data = _load_bookmarks()
+    rec = data.get(key)
+    if not rec:
+        return 0, 0
+    if rec.get("size") != size or rec.get("mtime") != mtime:
+        # The file was rewritten since: the saved place belongs to text that is gone.
+        data.pop(key, None)
+        _save_bookmarks(data)
         return 0, 0
     return int(rec.get("offset", 0)), int(rec.get("total", 0))
 
 
-def bookmark_set(path: str, offset: int | None, total: int = 0) -> None:
-    """Remember *offset* for *path*; None forgets it."""
+def bookmark_set(path: str, offset: int | None, total: int = 0, sig=None) -> None:
+    """Remember *offset* for *path*; None forgets it.
+
+    *sig* is the (key, size, mtime) taken when the reading began: the offset is
+    into that text, so a file rewritten mid-reading must not inherit it.
+    """
     try:
-        key, size, mtime = _file_key(path)
+        key, size, mtime = sig or _file_key(path)
     except OSError:
         return
     data = _load_bookmarks()
@@ -874,6 +885,10 @@ def main() -> int:
     ap.add_argument("--file", help="speak this text or markdown file")
     ap.add_argument("--playing", action="store_true",
                     help="print 1 while a reading is under way, else 0")
+    ap.add_argument("--from-text", dest="from_text",
+                    help="with --file: start at the first place this text appears")
+    ap.add_argument("--from-percent", dest="from_percent", type=int,
+                    help="with --file: start this far into the text, at a sentence")
     ap.add_argument("--resume", action="store_true",
                     help="with --file: continue from the saved bookmark")
     ap.add_argument("--bookmark", metavar="PATH",
@@ -1015,13 +1030,24 @@ def main() -> int:
         base = 0
         if args.resume:
             base, _ = bookmark_get(args.file)
-            if 0 < base < full:
-                text = text[base:].lstrip()
-            else:
-                base = 0
+        elif args.from_text:
+            needle = re.sub(r"\s+", " ", args.from_text).strip()
+            base = max(text.find(needle), 0) if needle else 0
+        elif args.from_percent:
+            at = int(full * min(max(args.from_percent, 0), 99) / 100)
+            cut = max(text.rfind(". ", 0, at), text.rfind("! ", 0, at), text.rfind("? ", 0, at))
+            base = cut + 2 if cut >= 0 else 0
+        if 0 < base < full:
+            text = text[base:].lstrip()
+        else:
+            base = 0
+        try:
+            sig = _file_key(args.file)           # the text this reading is of
+        except OSError:
+            sig = None
 
-        def mark(off, _file=args.file, _base=base, _full=full):
-            bookmark_set(_file, None if off is None else _base + off, _full)
+        def mark(off, _file=args.file, _base=base, _full=full, _sig=sig):
+            bookmark_set(_file, None if off is None else _base + off, _full, _sig)
     if not text:
         print("nothing to speak", file=sys.stderr)
         return 1

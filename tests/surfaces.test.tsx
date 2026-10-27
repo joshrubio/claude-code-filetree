@@ -1198,6 +1198,7 @@ test('open with preview on desktop: text files get a read-aloud button, code fil
     await ui.post({ press: `${root}/${file}` }, { in: 'rows' })
     await clock.settle()
     expect(JSON.stringify(await ui.drawn()).includes('"key":"pv-read"')).toBe(has)
+    for (const key of ['pv-restart', 'pv-spot-prev', 'pv-spot-next', 'pv-spot-go']) expect(JSON.stringify(await ui.drawn()).includes(`"key":"${key}"`)).toBe(has)
     await ui.press({ key: 'back' })
     await clock.settle()
   }
