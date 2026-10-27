@@ -1568,7 +1568,7 @@ const READABLE = /\.(md|markdown|mdx|txt|text|rst)$/i
 const READ_MAX_CHARS = 60_000
 const READ_CHUNK_CHARS = 600
 let readingPath = ''
-let readPoll: (() => void) | null = null
+let readPoll: Timer | null = null
 // How far each file was read, in percent; 0 means nothing to resume.
 const readMarks = new Map<string, number>()
 
@@ -1597,7 +1597,7 @@ function knowReadMark($: EngineInterface, path: string): number {
 }
 
 function stopPolling(): void {
-  readPoll?.()
+  readPoll?.cancel()
   readPoll = null
 }
 
