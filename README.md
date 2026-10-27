@@ -175,3 +175,7 @@ The same checks run on macOS, Windows and Linux in CI on every push that touches
 [MIT](LICENSE). The treemap labels use glyphs from [Terminus Font](https://terminus-font.sourceforge.net/) by Dimitar Zhekov (Lat2-Terminus16, SIL Open Font License 1.1).
 
 *This project is inspired by my Omarchy app [FileBlade](https://github.com/data-goblin/fileblade)*
+
+## Read aloud
+
+In the preview of a text file (`.md`, `.markdown`, `.mdx`, `.txt`, `.rst`), a **read** button (key `r`) speaks the file aloud and turns into **stop** while it plays. The speech engine is the read-aloud script by Michael Gifford (MIT, in `scripts/read-aloud/`), used here as is, with `--file`, `--playing` and `--max-chars` added. It needs Python 3 on the PATH; the voice comes from that script's config (`python scripts/read-aloud/speak.py --list-voices`, `--set-voice`, `--setup kokoro`).

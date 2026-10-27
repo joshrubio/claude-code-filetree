@@ -1186,6 +1186,24 @@ test('open with preview on desktop: the file is drawn by the pane itself, with n
   await ui.unmount()
 })
 
+test('open with preview on desktop: text files get a read-aloud button, code files do not', { timeoutMs: 20_000, options: { open: 'preview' } }, async ($, on) => {
+  const root = '/Users/k/proj'
+  const clock = world(on, { os: 'darwin', env: { HOME: '/Users/k' }, cwd: root, top: '', status: '', numstat: '', dirs: { [root]: [['a.md', 'file'], ['a.ts', 'file']] }, files: { [`${root}/a.md`]: '# Title', [`${root}/a.ts`]: 'const a = 1' } }, [])
+  await $.session.start({ cwd: root, surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const props = { ...paneProps(60), scroll: { offset: 0, bodyRows: 20 } }
+  const ui = await $.ui.mount({ plugin: 'filetree', surface: 'desktop', component: 'Pane', requestId: 'filetree', props })
+  for (const [file, has] of [['a.md', true], ['a.ts', false]] as const) {
+    await ui.post({ press: `${root}/${file}` }, { in: 'rows' })
+    await ui.post({ press: `${root}/${file}` }, { in: 'rows' })
+    await clock.settle()
+    expect(JSON.stringify(await ui.drawn()).includes('"key":"pv-read"')).toBe(has)
+    await ui.press({ key: 'back' })
+    await clock.settle()
+  }
+  await ui.unmount()
+})
+
 test('an older directory listing never overwrites a newer one', { timeoutMs: 20_000 }, async ($, on) => {
   const ran: Ran = []
   const root = '/home/k/scratch'
