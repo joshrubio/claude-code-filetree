@@ -1032,7 +1032,10 @@ def main() -> int:
             base, _ = bookmark_get(args.file)
         elif args.from_text:
             needle = re.sub(r"\s+", " ", args.from_text).strip()
-            base = max(text.find(needle), 0) if needle else 0
+            base = text.find(needle) if needle else -1
+            if base < 0 and len(needle) > 40:
+                base = text.find(needle[:40])         # the tail may differ once spoken
+            base = max(base, 0)
         elif args.from_percent:
             at = int(full * min(max(args.from_percent, 0), 99) / 100)
             cut = max(text.rfind(". ", 0, at), text.rfind("! ", 0, at), text.rfind("? ", 0, at))

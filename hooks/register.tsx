@@ -1571,9 +1571,10 @@ let readingPath = ''
 let readPoll: Timer | null = null
 // How far each file was read, in percent; 0 means nothing to resume.
 const readMarks = new Map<string, number>()
-// Which start spot each file has chosen, and a fingerprint of the text it was chosen from.
-const readPicks = new Map<string, number>()
+// A fingerprint of the text each file was last shown with, to notice a rewrite.
 const readSigs = new Map<string, string>()
+// The file whose preview shows a start marker beside every paragraph.
+let pickingPath = ''
 
 async function speak($: EngineInterface, args: string[]): Promise<string | null> {
   const script = `${$.plugin.root}/scripts/read-aloud/speak.py`
@@ -1605,27 +1606,6 @@ function stopPolling(): void {
 }
 
 type ReadFrom = { kind: 'resume' } | { kind: 'start' } | { kind: 'text'; text: string } | { kind: 'percent'; n: number }
-type ReadSpot = { label: string; from: ReadFrom }
-
-// Where the person can start reading: the headings of a document, else tenths of it.
-function readSpots(text: string, markdown: boolean): ReadSpot[] {
-  const spots: ReadSpot[] = [{ label: 'the beginning', from: { kind: 'start' } }]
-  const heads: ReadSpot[] = []
-  if (markdown) {
-    let fenced = false
-    for (const line of text.split('\n')) {
-      if (/^\s*(```|~~~)/.test(line)) fenced = !fenced
-      const m = fenced ? null : /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line)
-      if (!m) continue
-      // The script reads the document the way it speaks it: no markup, link text only.
-      const plain = (m[2] ?? '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[*_`>#]+/g, '').replace(/\s+/g, ' ').trim()
-      if (plain) heads.push({ label: plain, from: { kind: 'text', text: plain } })
-    }
-  }
-  if (heads.length) return [...spots, ...heads.slice(0, 80)]
-  for (let n = 10; n < 100; n += 10) spots.push({ label: `${n}%`, from: { kind: 'percent', n } })
-  return spots
-}
 
 async function stopReading($: EngineInterface, path: string): Promise<void> {
   stopPolling()
@@ -1661,6 +1641,7 @@ async function startReading($: EngineInterface, path: string, from: ReadFrom): P
 }
 
 async function closePreview($: EngineInterface): Promise<void> {
+  pickingPath = ''
   await patch($, () => ({ preview: '', previewTop: 0 }))
   $.clock.after(100, async () => focusPane($, (await get($)).root, treeKey()))
 }
@@ -1687,9 +1668,41 @@ async function scrollPreview($: EngineInterface, by: number): Promise<void> {
   if (top !== t.previewTop) await patch($, () => ({ previewTop: top }))
 }
 
+// The text a paragraph is found by in the script: its first line as it is spoken (no markup).
+function startNeedle(block: string): string {
+  const first = block.split('\n').find(line => line.trim()) ?? ''
+  if (/^\s*(```|~~~|\|)/.test(first)) return ''
+  return first
+    .replace(/^\s*(#{1,6}\s+|[-*+]\s+|>\s*)/, '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/[*_`>#]+/g, '')
+    .replace(/https?:\/\/\S+/g, ' link ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100)
+}
+
+function paragraphs(text: string): string[] {
+  const blocks: string[] = []
+  let cur: string[] = []
+  let fenced = false
+  for (const line of text.split('\n')) {
+    if (/^\s*(```|~~~)/.test(line)) fenced = !fenced
+    if (!fenced && !line.trim()) {
+      if (cur.length) blocks.push(cur.join('\n'))
+      cur = []
+    } else cur.push(line)
+  }
+  if (cur.length) blocks.push(cur.join('\n'))
+  return blocks
+}
+
+const PICK_MAX_BLOCKS = 400
+
 // The desktop draws the whole file straight from the pane: the same text through a Client drew nothing there.
-function directPreview(elements: any, win: { text: string; top: number } | { segments: { title: string; source: string }[]; top: number }, path: string, markdown: boolean, accent: string) {
-  const { Box, Text, Markdown, Code } = elements
+function directPreview(elements: any, win: { text: string; top: number } | { segments: { title: string; source: string }[]; top: number }, path: string, markdown: boolean, accent: string, pick?: (needle: string) => void) {
+  const { Box, Text, Markdown, Code, Button } = elements
   if ('segments' in win) {
     return (
       <Box flexDirection="column">
@@ -1699,6 +1712,26 @@ function directPreview(elements: any, win: { text: string; top: number } | { seg
             {g.source ? <Code source={g.source} path={g.title || path} format="diff" wrap="truncate-end" /> : null}
           </Box>
         ))}
+      </Box>
+    )
+  }
+  if (pick) {
+    // Choose-start mode: a marker beside every paragraph that starts the reading there.
+    return (
+      <Box flexDirection="column" rowGap="sm">
+        {paragraphs(win.text).slice(0, PICK_MAX_BLOCKS).map((block, i) => {
+          const needle = startNeedle(block)
+          return (
+            <Box key={`blk-${i}`} flexDirection="row" gap="md">
+              <Box flexShrink={0}>
+                {needle ? <Button key={`pv-at-${i}`} plain dimColor label="▶" onPress={() => pick(needle)} /> : <Text> </Text>}
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                {markdown ? <Markdown text={block} /> : <Text>{block}</Text>}
+              </Box>
+            </Box>
+          )
+        })}
       </Box>
     )
   }
@@ -2268,44 +2301,34 @@ export const register: Register = (on, options) => {
           {READABLE.test(t.preview) ? (() => {
             const path = t.preview
             const text = p?.text ?? ''
-            // A rewritten file is a different text: forget the place and the spot chosen in the old one.
+            // A rewritten file is a different text: forget the place saved in the old one.
             const sig = `${text.length}:${text.slice(0, 200)}:${text.slice(-200)}`
             if (readSigs.get(path) !== sig) {
-              if (readSigs.has(path)) {
-                readMarks.delete(path)
-                readPicks.delete(path)
-              }
+              if (readSigs.has(path)) readMarks.delete(path)
               readSigs.set(path, sig)
             }
             const isReading = readingPath === path
             const mark = isReading ? 0 : knowReadMark($, path)
-            const spots = readSpots(text, markdown)
-            const pick = Math.min(readPicks.get(path) ?? 0, spots.length - 1)
-            const spot = spots[pick] ?? spots[0]
-            const shortLabel = (spot?.label ?? '').length > 34 ? `${(spot?.label ?? '').slice(0, 33)}…` : spot?.label ?? ''
-            const move = (by: number) => {
-              readPicks.set(path, (pick + by + spots.length) % spots.length)
+            const isPicking = nativeScroll && pickingPath === path
+            const label = isReading ? (unicode ? '■ stop' : '\u{f04d} stop') : mark ? `${unicode ? '▶' : '\u{f028}'} resume ${mark}%` : unicode ? '▶ read' : '\u{f028} read'
+            const choose = () => {
+              if (isPicking) pickingPath = ''
+              else if (paragraphs(text).length > PICK_MAX_BLOCKS) {
+                $.ui.toast(`choose start works up to ${PICK_MAX_BLOCKS} paragraphs; use restart or resume`)
+                return
+              } else pickingPath = path
               $.ui.invalidate('ui.render')
             }
-            const label = isReading ? (unicode ? '■ stop' : '\u{f04d} stop') : mark ? `${unicode ? '▶' : '\u{f028}'} resume ${mark}%` : unicode ? '▶ read' : '\u{f028} read'
             return (
-              <Box flexDirection="column">
-                <Box flexDirection="row" gap={2}>
-                  <Button key="pv-read" plain dimColor hotkey="r" label={label} onPress={() => void (isReading ? stopReading($, path) : startReading($, path, mark ? { kind: 'resume' } : { kind: 'start' }))} />
-                  <Button key="pv-restart" plain dimColor hotkey="s" label={unicode ? '⟲ restart' : '\u{f021} restart'} onPress={() => void startReading($, path, { kind: 'start' })} />
-                </Box>
-                <Box flexDirection="row" gap={2}>
-                  <Text {...mutedText}>start at</Text>
-                  <Button key="pv-spot-prev" plain dimColor label="◀" onPress={() => move(-1)} />
-                  <Text>{shortLabel}</Text>
-                  <Button key="pv-spot-next" plain dimColor label="▶" onPress={() => move(1)} />
-                  <Button key="pv-spot-go" plain dimColor hotkey="g" label={unicode ? '▶ from here' : '\u{f028} from here'} onPress={() => void startReading($, path, spot?.from ?? { kind: 'start' })} />
-                </Box>
+              <Box flexDirection="row" gap="md" paddingY="sm">
+                <Button key="pv-read" variant="primary" hotkey="r" label={label} onPress={() => void (isReading ? stopReading($, path) : startReading($, path, mark ? { kind: 'resume' } : { kind: 'start' }))} />
+                <Button key="pv-restart" variant="secondary" hotkey="s" label={unicode ? '⟲ restart' : '\u{f021} restart'} onPress={() => void startReading($, path, { kind: 'start' })} />
+                {nativeScroll ? <Button key="pv-choose" variant="secondary" hotkey="g" label={isPicking ? (unicode ? '✕ cancel' : '\u{f00d} cancel') : unicode ? '⌖ choose start' : '\u{f05b} choose start'} onPress={choose} /> : null}
               </Box>
             )
           })() : null}
           {p?.note ? <Text {...mutedText}>{p.note}</Text> : null}
-          {nativeScroll ? directPreview(elements, win, t.preview, markdown, theme.accent) : (
+          {nativeScroll ? directPreview(elements, win, t.preview, markdown, theme.accent, READABLE.test(t.preview) && pickingPath === t.preview ? needle => { pickingPath = ''; void startReading($, t.preview, { kind: 'text', text: needle }) } : undefined) : (
             <Client
               key="rows"
               module="./rows.tsx"
