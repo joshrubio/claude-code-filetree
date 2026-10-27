@@ -8,6 +8,8 @@
   speak.py --stdin              speak the text arriving on stdin
   speak.py --file PATH          speak a text or markdown file
   speak.py --playing            print 1 while a reading is under way, else 0
+  speak.py --file PATH --resume continue a file from where it stopped
+  speak.py --bookmark PATH      print how far a file was read, as a percent
   speak.py --stop               stop playback
   speak.py --detach             re-launch detached, return immediately
   speak.py --hook               Stop-hook mode: exit fast unless auto_read is on
@@ -223,6 +225,61 @@ def chunk_text(s: str, first: int, full: int) -> list[str]:
     if cur:
         parts.append(cur)
     return parts
+
+# ---------------------------------------------------------------- bookmarks
+# Reading a file remembers where it was: the start of the chunk on air, kept per
+# file and valid only while the file's size and mtime are unchanged.
+
+
+def _bookmark_path() -> pathlib.Path:
+    return config_path().parent / "bookmarks.json"
+
+
+def _file_key(path: str) -> tuple[str, int, float]:
+    p = pathlib.Path(path).resolve()
+    st = p.stat()
+    return str(p), st.st_size, st.st_mtime
+
+
+def _load_bookmarks() -> dict:
+    try:
+        return json.loads(_bookmark_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_bookmarks(data: dict) -> None:
+    try:
+        _bookmark_path().write_text(json.dumps(data, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def bookmark_get(path: str, total: int | None = None) -> tuple[int, int]:
+    """(offset, total) of a valid bookmark for *path*, or (0, 0)."""
+    try:
+        key, size, mtime = _file_key(path)
+    except OSError:
+        return 0, 0
+    rec = _load_bookmarks().get(key)
+    if not rec or rec.get("size") != size or rec.get("mtime") != mtime:
+        return 0, 0
+    return int(rec.get("offset", 0)), int(rec.get("total", 0))
+
+
+def bookmark_set(path: str, offset: int | None, total: int = 0) -> None:
+    """Remember *offset* for *path*; None forgets it."""
+    try:
+        key, size, mtime = _file_key(path)
+    except OSError:
+        return
+    data = _load_bookmarks()
+    if offset is None:
+        data.pop(key, None)
+    else:
+        data[key] = {"offset": offset, "total": total, "size": size, "mtime": mtime}
+    _save_bookmarks(data)
+
 
 # ------------------------------------------------------------------- audio plumbing
 
@@ -553,7 +610,14 @@ def stop() -> None:
     if pid == os.getpid():
         return
     try:
-        os.kill(pid, signal.SIGTERM)
+        if IS_WIN:
+            # os.kill is TerminateProcess here: it ends this process but not the
+            # player or the voice runner it started, so the sentence on air would
+            # play out. /T takes the whole tree down.
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, **quiet_win())
+        else:
+            os.kill(pid, signal.SIGTERM)
     except OSError:
         pass                                     # already gone, or not ours
     PIDFILE.unlink(missing_ok=True)
@@ -607,14 +671,19 @@ def _sweep_parts() -> None:
         pass
 
 
-def play_chunked(text: str, cfg: dict, synth) -> None:
+def play_chunked(text: str, cfg: dict, synth, mark=None) -> None:
     """Gapless chunked playback: synthesise chunk i+1 while chunk i plays."""
     global _player
     claim()                                      # never overlap two readings
 
     chunks = chunk_text(text, int(cfg["first_chars"]), int(cfg["chunk_chars"]))
+    offsets = [0]
+    for c in chunks:
+        offsets.append(offsets[-1] + len(c) + 1)
     synth(chunks[0], PARTS[0])
     for i in range(len(chunks)):
+        if mark:
+            mark(offsets[i])                     # where a stop here would resume
         cur = PARTS[i % 2]
         _player = subprocess.Popen(
             player_cmd(cur), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -627,6 +696,8 @@ def play_chunked(text: str, cfg: dict, synth) -> None:
         _player.wait()
         if prefetch:
             prefetch.join()
+    if mark:
+        mark(None)                               # read to the end: nothing to resume
     release()
 
 # --------------------------------------------------------------------------- modes
@@ -803,6 +874,12 @@ def main() -> int:
     ap.add_argument("--file", help="speak this text or markdown file")
     ap.add_argument("--playing", action="store_true",
                     help="print 1 while a reading is under way, else 0")
+    ap.add_argument("--resume", action="store_true",
+                    help="with --file: continue from the saved bookmark")
+    ap.add_argument("--bookmark", metavar="PATH",
+                    help="print the saved position of PATH as a percent, or nothing")
+    ap.add_argument("--chunk-chars", dest="chunk_chars", type=int,
+                    help="size of one spoken chunk for this run")
     ap.add_argument("--max-chars", dest="max_chars", type=int,
                     help="cap on spoken characters for this run")
     ap.add_argument("--transcript")
@@ -882,6 +959,12 @@ def main() -> int:
         print(f"auto-read {'on — every reply will be spoken' if cfg['auto_read'] else 'off'}")
         return 0
 
+    if args.bookmark:
+        off, total = bookmark_get(args.bookmark)
+        if off > 0 and total > 0:
+            print(max(1, min(99, round(100 * off / total))))
+        return 0
+
     if args.playing:
         # A pidfile newer than the longest possible reading means a voice is on.
         try:
@@ -922,7 +1005,23 @@ def main() -> int:
             return 1
         raw = last_reply(t)
 
+    if args.chunk_chars:
+        cfg["chunk_chars"] = args.chunk_chars
+        cfg["first_chars"] = min(int(cfg["first_chars"]), args.chunk_chars)
     text = spoken_form(raw, int(args.max_chars or cfg["max_chars"]))
+    mark = None
+    if args.file and text:
+        full = len(text)
+        base = 0
+        if args.resume:
+            base, _ = bookmark_get(args.file)
+            if 0 < base < full:
+                text = text[base:].lstrip()
+            else:
+                base = 0
+
+        def mark(off, _file=args.file, _base=base, _full=full):
+            bookmark_set(_file, None if off is None else _base + off, _full)
     if not text:
         print("nothing to speak", file=sys.stderr)
         return 1
@@ -937,7 +1036,7 @@ def main() -> int:
     if synth is None:
         speak_direct(text, cfg)
     else:
-        play_chunked(text, cfg, synth)
+        play_chunked(text, cfg, synth, mark)
     return 0
 
 

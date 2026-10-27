@@ -1566,8 +1566,11 @@ function parkPreview($: EngineInterface): void {
 // The voice comes from that script's own config: run it with --status, --list-voices or --setup.
 const READABLE = /\.(md|markdown|mdx|txt|text|rst)$/i
 const READ_MAX_CHARS = 60_000
-let reading = false
+const READ_CHUNK_CHARS = 600
+let readingPath = ''
 let readPoll: (() => void) | null = null
+// How far each file was read, in percent; 0 means nothing to resume.
+const readMarks = new Map<string, number>()
 
 async function speak($: EngineInterface, args: string[]): Promise<string | null> {
   const script = `${$.plugin.root}/scripts/read-aloud/speak.py`
@@ -1579,28 +1582,48 @@ async function speak($: EngineInterface, args: string[]): Promise<string | null>
   return null
 }
 
-async function toggleReading($: EngineInterface, path: string): Promise<void> {
-  if (reading) {
-    readPoll?.()
-    readPoll = null
-    reading = false
+async function refreshReadMark($: EngineInterface, path: string): Promise<void> {
+  const out = await speak($, ['--bookmark', path])
+  readMarks.set(path, Number(out?.trim()) || 0)
+}
+
+// Asked once per file, while its preview draws, so the button can say resume.
+function knowReadMark($: EngineInterface, path: string): number {
+  const known = readMarks.get(path)
+  if (known !== undefined) return known
+  readMarks.set(path, 0)
+  void refreshReadMark($, path).then(() => $.ui.invalidate('ui.render'))
+  return 0
+}
+
+function stopPolling(): void {
+  readPoll?.()
+  readPoll = null
+}
+
+async function toggleReading($: EngineInterface, path: string, how: 'resume' | 'start'): Promise<void> {
+  if (readingPath === path) {
+    stopPolling()
+    readingPath = ''
     await speak($, ['--stop'])
+    await refreshReadMark($, path)
     $.ui.invalidate('ui.render')
     return
   }
-  const started = await speak($, ['--detach', '--file', path, '--max-chars', String(READ_MAX_CHARS)])
+  const args = ['--detach', '--file', path, '--max-chars', String(READ_MAX_CHARS), '--chunk-chars', String(READ_CHUNK_CHARS)]
+  const started = await speak($, how === 'resume' ? [...args, '--resume'] : args)
   if (started === null) {
     $.ui.toast('could not read aloud: python or the speech script is missing')
     return
   }
-  reading = true
-  readPoll?.()
+  readingPath = path
+  stopPolling()
   readPoll = $.clock.every(2_000, () => {
-    void speak($, ['--playing']).then(out => {
-      if (out?.trim() === '1') return
-      reading = false
-      readPoll?.()
-      readPoll = null
+    void speak($, ['--playing']).then(async out => {
+      if (out?.trim() === '1' || readingPath !== path) return
+      stopPolling()
+      readingPath = ''
+      await refreshReadMark($, path)
       $.ui.invalidate('ui.render')
     })
   })
@@ -2210,7 +2233,15 @@ export const register: Register = (on, options) => {
               return <Button key={`pv-${k}`} plain dimColor hotkey={k} label={label} onPress={() => void (step ? jumpDiff($, by > 0 ? 1 : -1) : scrollPreview($, by)).then(() => parkPreview($))} />
             })}
             <Button key="pv-d" plain dimColor hotkey="d" label={p?.diff ? (t.nodes.find(n => n.id === t.preview)?.kind === 'dir' ? 'tree' : 'file') : 'diff'} onPress={() => void diffFile($, t.preview)} />
-            {READABLE.test(t.preview) ? <Button key="pv-read" plain dimColor hotkey="r" label={reading ? (unicode ? '■ stop' : '\u{f04d} stop') : (unicode ? '▶ read' : '\u{f028} read')} onPress={() => void toggleReading($, t.preview)} /> : null}
+            {READABLE.test(t.preview) ? (() => {
+              const mark = readingPath === t.preview ? 0 : knowReadMark($, t.preview)
+              const isReading = readingPath === t.preview
+              const label = isReading ? (unicode ? '■ stop' : '\u{f04d} stop') : mark ? `${unicode ? '▶' : '\u{f028}'} resume ${mark}%` : unicode ? '▶ read' : '\u{f028} read'
+              return [
+                <Button key="pv-read" plain dimColor hotkey="r" label={label} onPress={() => void toggleReading($, t.preview, mark ? 'resume' : 'start')} />,
+                mark ? <Button key="pv-restart" plain dimColor hotkey="s" label={unicode ? '⟲ start over' : '\u{f021} start over'} onPress={() => void toggleReading($, t.preview, 'start')} /> : null,
+              ]
+            })() : null}
             {editWithSetting || inTmux || inHerdr ? <Button key="edit" plain dimColor autoFocus hotkey="e" label={`${unicode ? 'edit' : '\u{ea73} edit'} :${previewLine}`} onPress={() => void editPreview($, t.preview)} /> : null}
           </Box>
           {p?.note ? <Text {...mutedText}>{p.note}</Text> : null}
